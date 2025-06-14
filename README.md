@@ -2,7 +2,7 @@
 
 This Django-based orchestration service executes two distinct batches of parallel tasks, each followed by an aggregation task (one after the other). It is built using Django, Celery, Redis, and Docker Compose.
 
----
+The core logic can be found in `orchestrator/tasks.py` and `orchestrator/views.py`
 
 ## Prerequisites
 
