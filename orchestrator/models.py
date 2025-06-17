@@ -27,4 +27,21 @@ class Job(models.Model):
         ]
 
     def __str__(self):
-        return f"{self.username} - {self.job_id} - {self.status}" 
+        return f"{self.username} - {self.job_id} - {self.status}"
+        
+    def mark_running(self):
+        """Mark the job as running."""
+        self.status = 'RUNNING'
+        self.save()
+        
+    def mark_completed(self, result):
+        """Mark the job as completed with the given result."""
+        self.status = 'COMPLETED'
+        self.result = result
+        self.save()
+        
+    def mark_failed(self, error):
+        """Mark the job as failed with the given error message."""
+        self.status = 'FAILED'
+        self.error = error
+        self.save() 

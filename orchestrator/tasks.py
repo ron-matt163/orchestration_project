@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 @shared_task
 def run_task(task_id, base_value=None):
     try:
-        time.sleep(random.randint(1, 3))
+        time.sleep(3 * 60)
         n = random.randint(100, 999)
         if base_value is not None:
             n += base_value
@@ -28,7 +28,7 @@ def run_task(task_id, base_value=None):
 
 @shared_task
 def aggregate(batch_results, username=None):
-    time.sleep(30)
+    time.sleep(3 * 60)
     total = sum(x["result"] for x in batch_results)
     return {
         "aggregated_sum": total,
@@ -56,11 +56,8 @@ def create_second_batch(agg_result, job_id):
                     raise ValueError(f"Unexpected result type: {type(agg_result)}")
             except json.JSONDecodeError as e:
                 logger.error("Failed to parse result as JSON: %s", e)
-                # Update job status to failed
                 job = Job.objects.get(job_id=job_id)
-                job.status = 'FAILED'
-                job.error = f"Failed to parse aggregation result: {str(e)}"
-                job.save()
+                job.mark_failed(f"Failed to parse aggregation result: {str(e)}")
                 raise
         
         if not username:
@@ -76,11 +73,8 @@ def create_second_batch(agg_result, job_id):
             "first_agg": agg_result
         }
     except Exception as e:
-        # Update job status to failed
         job = Job.objects.get(job_id=job_id)
-        job.status = 'FAILED'
-        job.error = str(e)
-        job.save()
+        job.mark_failed(str(e))
         raise
 
 @shared_task
@@ -107,11 +101,8 @@ def run_second_batch(batch_data, job_id):
         
     except Exception as e:
         logger.error("Error in run_second_batch: %s", str(e), exc_info=True)
-        # Update job status to failed
         job = Job.objects.get(job_id=job_id)
-        job.status = 'FAILED'
-        job.error = str(e)
-        job.save()
+        job.mark_failed(str(e))
         raise
 
 @shared_task
@@ -122,24 +113,19 @@ def finalize_results(second_agg, job_id, first_agg):
         
         # Combine results
         final_result = {
-            "first_batch": first_agg,
-            "second_batch": second_agg
+            "first_batch": {"aggregated_sum": first_agg["aggregated_sum"]},
+            "second_batch": {"aggregated_sum": second_agg["aggregated_sum"]}
         }
         
         # Update job status and result
         job = Job.objects.get(job_id=job_id)
-        job.status = 'COMPLETED'
-        job.result = json.dumps(final_result)
-        job.save()
+        job.mark_completed(json.dumps(final_result))
         
         return final_result
     except Exception as e:
         logger.error("Error in finalize_results: %s", str(e), exc_info=True)
-        # Update job status to failed
         job = Job.objects.get(job_id=job_id)
-        job.status = 'FAILED'
-        job.error = str(e)
-        job.save()
+        job.mark_failed(str(e))
         raise
 
 @shared_task(bind=True)
@@ -148,8 +134,7 @@ def orchestrate_tasks(self, username, job_id):
     try:
         # Update job status to running
         job = Job.objects.get(job_id=job_id)
-        job.status = 'RUNNING'
-        job.save()
+        job.mark_running()
         
         # Create first batch
         first_batch = group(run_task.s(f"{username}-b1-{i}") for i in range(5))
@@ -165,9 +150,6 @@ def orchestrate_tasks(self, username, job_id):
         workflow.apply_async()
         
     except Exception as e:
-        # Update job status to failed
         job = Job.objects.get(job_id=job_id)
-        job.status = 'FAILED'
-        job.error = str(e)
-        job.save()
+        job.mark_failed(str(e))
         raise
