@@ -7,6 +7,7 @@ from celery import shared_task, group, chord, chain
 from orchestrator.models import Job
 from django.db.models.manager import Manager
 from celery.result import AsyncResult
+from celery.canvas import signature
 
 # Type hint for linter
 Job.objects: Manager
@@ -36,7 +37,7 @@ def aggregate(batch_results, username=None):
 
 @shared_task
 def create_second_batch(agg_result, job_id):
-    """Creates and executes the second batch of tasks with the base value from first aggregation."""
+    """Creates the second batch of tasks with the base value from first aggregation."""
     try:
         logger.info("Received agg_result: %s (type: %s)", agg_result, type(agg_result))
         
@@ -68,14 +69,10 @@ def create_second_batch(agg_result, job_id):
         # Create the second batch group
         second_batch = group(run_task.s(f"{username}-b2-{i}", base) for i in range(5))
         
-        # Create and execute the chord
-        logger.info("Creating and executing chord for second batch with base: %s", base)
-        chord_obj = chord(second_batch, aggregate.s(username=username))
-        result = chord_obj.apply_async()
-        
-        # Return both the chord result ID and first aggregation
+        # Create the chord for the second batch
+        logger.info("Creating chord for second batch with base: %s", base)
         return {
-            "chord_id": result.id,
+            "chord": chord(second_batch, aggregate.s(username=username)),
             "first_agg": agg_result
         }
     except Exception as e:
@@ -87,16 +84,41 @@ def create_second_batch(agg_result, job_id):
         raise
 
 @shared_task
-def finalize_results(results, job_id):
+def run_second_batch(batch_data, job_id):
+    """Runs the second batch and chains to finalize_results."""
+    try:
+        logger.info("Starting run_second_batch with batch_data: %s", batch_data)
+        chord_data = batch_data["chord"]
+        first_agg = batch_data["first_agg"]
+        
+        # Reconstruct the chord from the data
+        header = [signature(task) for task in chord_data["kwargs"]["header"]]
+        body = signature(chord_data["kwargs"]["body"])
+        chord_obj = chord(header, body)
+        
+        # Create a chain that will run the chord and then finalize
+        workflow = chain(
+            chord_obj,
+            finalize_results.s(job_id=job_id, first_agg=first_agg)
+        )
+        
+        # Start the workflow
+        workflow.apply_async()
+        
+    except Exception as e:
+        logger.error("Error in run_second_batch: %s", str(e), exc_info=True)
+        # Update job status to failed
+        job = Job.objects.get(job_id=job_id)
+        job.status = 'FAILED'
+        job.error = str(e)
+        job.save()
+        raise
+
+@shared_task
+def finalize_results(second_agg, job_id, first_agg):
     """Combines results from both batches into a final dictionary."""
     try:
-        logger.info("Finalizing results: %s", results)
-        chord_id = results["chord_id"]
-        first_agg = results["first_agg"]
-        
-        # Get the chord result
-        chord_result = AsyncResult(chord_id)
-        second_agg = chord_result.result
+        logger.info("Finalizing results - first_agg: %s, second_agg: %s", first_agg, second_agg)
         
         # Combine results
         final_result = {
@@ -136,7 +158,7 @@ def orchestrate_tasks(self, username, job_id):
         workflow = chain(
             chord(first_batch, aggregate.s(username=username)),
             create_second_batch.s(job_id=job_id),
-            finalize_results.s(job_id=job_id)
+            run_second_batch.s(job_id=job_id)
         )
         
         # Start the workflow
