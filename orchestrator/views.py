@@ -1,39 +1,65 @@
+"""
+REST endpoints for launching and monitoring orchestration jobs.
+"""
+
+import logging
+from collections import defaultdict
+from celery.result import AsyncResult
+from rest_framework import status
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
-from celery import group
-from orchestrator.tasks import run_task, aggregate_results
 
+from orchestrator.tasks import orchestrate_tasks
+
+logger = logging.getLogger(__name__)
+MAX_CONCURRENT_JOBS = 3
+running_jobs: dict[str, set[str]] = defaultdict(set)
 
 @api_view(["POST"])
-def orchestrate(request):
-    """
-    Executes two batches of parallel tasks with intermediate aggregation
-    and returns all results.
-    """
-    # ---------- First batch of 5 parallel tasks ----------
-    batch1_group = group(run_task.s(f"batch1-{i}") for i in range(5)).apply_async()
-    batch1_results = batch1_group.get(timeout=300)        # <-- blocks until done
+def orchestrate(request, username: str):
+    active = running_jobs[username]
+    if len(active) >= MAX_CONCURRENT_JOBS:
+        return Response(
+            {"detail": f"User '{username}' already has {MAX_CONCURRENT_JOBS} running jobs."},
+            status=status.HTTP_429_TOO_MANY_REQUESTS,
+        )
 
-    # ---------- First aggregation task ----------
-    aggregation1_task = aggregate_results.s(batch1_results).apply_async()
-    aggregation1 = aggregation1_task.get(timeout=310)
-    base_value = aggregation1["aggregated_sum"] // 5
-
-    # ---------- Second batch of 5 parallel tasks ----------
-    batch2_group = group(
-        run_task.s(f"batch2-{i}", base_value=base_value) for i in range(5)
-    ).apply_async()
-    batch2_results = batch2_group.get(timeout=300)
-
-    # ---------- Final aggregation ----------
-    aggregation2_task = aggregate_results.s(batch2_results).apply_async()
-    aggregation2 = aggregation2_task.get(timeout=310)
+    # Start the workflow and get the final task ID
+    result = orchestrate_tasks.apply_async(args=[username])
+    task_id = result.id
+    active.add(task_id)
 
     return Response(
         {
-            "batch1": batch1_results,
-            "first_aggregation": aggregation1,
-            "batch2": batch2_results,
-            "second_aggregation": aggregation2,
-        }
+            "message": "Orchestration started.",
+            "task_id": task_id,
+            "status_url": f"/status/{username}/{task_id}",
+        },
+        status=status.HTTP_202_ACCEPTED,
     )
+
+@api_view(["GET"])
+def job_status(request, username: str, task_id: str):
+    async_res = AsyncResult(task_id)
+    data = {"task_id": task_id, "state": async_res.state}
+
+    if async_res.state == "SUCCESS":
+        logger.info("Task %s completed with result type: %s", task_id, type(async_res.result))
+        logger.info("Task %s result: %s", task_id, async_res.result)
+        data["result"] = async_res.result
+    elif async_res.state == "FAILURE":
+        data["error"] = str(async_res.result)
+    elif async_res.state == "PENDING":
+        data["message"] = "Task is waiting for execution or unknown."
+    elif async_res.state == "STARTED":
+        data["message"] = "Task has been started."
+    elif async_res.state == "RETRY":
+        data["message"] = "Task is being retried."
+
+    # free slot when job is done
+    if async_res.ready() and task_id in running_jobs.get(username, set()):
+        running_jobs[username].discard(task_id)
+        if not running_jobs[username]:
+            running_jobs.pop(username, None)
+
+    return Response(data)
